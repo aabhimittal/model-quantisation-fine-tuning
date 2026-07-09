@@ -114,6 +114,28 @@ Because "low-latency" is a claim you should be able to *check*, the client measu
 **time-to-first-token** (how long until the stream starts) and **tokens/sec**
 (sustained throughput) on every call — the serving analogue of the VRAM table.
 
+### Grounding & hallucination
+
+Section 1 said fine-tuning teaches *behaviour*, and *facts* belong in retrieval (RAG)
+so they don't get baked into the weights and hallucinated. That decision has a direct
+serving-time consequence. Asked "what does QLoRA solve?", a small model answering from
+its parameters alone will happily invent "Quantum LoRA" — the weights are a lossy,
+uncertain store of facts.
+
+**Grounded generation** applies the RAG rule at inference: instead of trusting the
+weights, you hand the model the source text and instruct it to answer *only* from that,
+citing which snippet it used, and to say "I don't know" when the sources don't cover the
+question (`quantune.serving.GROUNDING_SYSTEM_PROMPT`). The facts come from the context
+you control, not from parametric memory, so there is far less room to confabulate.
+
+To keep this honest and inspectable, `quantune.serving.groundedness` returns the
+fraction of the answer's content words that actually appear in the supplied sources.
+A high score means the answer stays close to its evidence; a low score means it
+introduced text that isn't there — the fingerprint of a hallucination. Like the VRAM
+numbers, it's a deliberately simple proxy: **it flags unsupported text, it does not
+prove the answer is true.** Pair it with `temperature=0` (greedy decoding) so factual
+answers are deterministic rather than sampled.
+
 ## References
 
 1. Hu et al., *LoRA: Low-Rank Adaptation of Large Language Models* (2021), arXiv:2106.09685.

@@ -39,12 +39,25 @@ import json
 import os
 import time
 import urllib.error
+import re
 import urllib.request
 from dataclasses import dataclass
-from typing import Callable, Iterator, List, Optional
+from typing import Callable, Iterator, List, Optional, Sequence
 
 DEFAULT_BASE_URL = "https://integrate.api.nvidia.com/v1"
 DEFAULT_MODEL = "meta/llama-3.1-8b-instruct"
+
+# Told to the model in grounded mode: answer only from the supplied sources, or
+# abstain. This is the serving-layer version of quantune's "RAG for facts" rule --
+# it stops the model inventing facts from parametric memory (the demo's "Quantum
+# LoRA"/"nuclear physics" failures).
+GROUNDING_SYSTEM_PROMPT = (
+    "You are a careful assistant. Answer the user's question using ONLY the "
+    "information in the provided context. If the context does not contain the "
+    "answer, reply with exactly \"I don't know.\" Do not use any outside knowledge "
+    "and do not guess. Cite the source number(s) you used in square brackets, "
+    "e.g. [1]."
+)
 
 
 @dataclass
@@ -58,6 +71,9 @@ class GenerationResult:
     latency_s: float                       # wall-clock for the whole call
     time_to_first_token_s: Optional[float]  # only measurable when streaming
     tokens_per_s: float
+    # Populated only in grounded mode (when ``context`` was supplied):
+    grounded_fraction: Optional[float] = None  # share of answer words found in context
+    abstained: bool = False                     # model said "I don't know."
 
     def summary(self) -> str:
         ttft = (
@@ -65,13 +81,18 @@ class GenerationResult:
             if self.time_to_first_token_s is not None
             else "n/a (non-streaming)"
         )
-        return (
-            f"model={self.model}  "
-            f"tokens={self.completion_tokens} (+{self.prompt_tokens} prompt)  "
-            f"ttft={ttft}  "
-            f"speed={self.tokens_per_s:.1f} tok/s  "
-            f"total={self.latency_s:.2f}s"
-        )
+        parts = [
+            f"model={self.model}",
+            f"tokens={self.completion_tokens} (+{self.prompt_tokens} prompt)",
+            f"ttft={ttft}",
+            f"speed={self.tokens_per_s:.1f} tok/s",
+            f"total={self.latency_s:.2f}s",
+        ]
+        if self.abstained:
+            parts.append("grounded=abstained")
+        elif self.grounded_fraction is not None:
+            parts.append(f"grounded={self.grounded_fraction * 100:.0f}%")
+        return "  ".join(parts)
 
 
 class ServingError(RuntimeError):
@@ -152,18 +173,31 @@ class OpenAICompatClient:
         temperature: float = 0.2,
         stream: bool = False,
         on_token: Optional[Callable[[str], None]] = None,
+        context: Optional[Sequence[str]] = None,
+        grounded: Optional[bool] = None,
     ) -> GenerationResult:
         """Generate a completion for ``prompt`` and measure how fast it came back.
 
         When ``stream=True`` the response is consumed token-by-token (so
         ``time_to_first_token_s`` is meaningful and ``on_token`` fires as text
         arrives); otherwise the full JSON reply is awaited in one shot.
+
+        **Grounded mode** (the anti-hallucination path). Pass ``context`` -- a list
+        of source snippets -- to constrain the answer to those sources: the model is
+        told to answer only from them or reply "I don't know", and the result carries
+        a :attr:`GenerationResult.grounded_fraction` score plus an ``abstained`` flag.
+        ``grounded`` defaults to ``True`` whenever ``context`` is given; set it True
+        with no context to apply the strict system prompt on its own. For factual
+        questions, also pass ``temperature=0`` for deterministic (greedy) decoding.
         """
         self._require_key()
+        use_grounding = grounded if grounded is not None else bool(context)
         messages = []
-        if system:
+        if use_grounding:
+            messages.append({"role": "system", "content": system or GROUNDING_SYSTEM_PROMPT})
+        elif system:
             messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
+        messages.append({"role": "user", "content": _build_user_content(prompt, context)})
         payload = {
             "model": model,
             "messages": messages,
@@ -171,9 +205,15 @@ class OpenAICompatClient:
             "temperature": temperature,
             "stream": stream,
         }
-        if stream:
-            return self._generate_streaming(payload, model, on_token)
-        return self._generate_blocking(payload, model)
+        result = (
+            self._generate_streaming(payload, model, on_token)
+            if stream
+            else self._generate_blocking(payload, model)
+        )
+        if context:
+            result.abstained = _is_abstention(result.text)
+            result.grounded_fraction = groundedness(result.text, context)
+        return result
 
     def _generate_blocking(self, payload: dict, model: str) -> GenerationResult:
         start = time.perf_counter()
@@ -253,3 +293,56 @@ def _iter_sse(resp) -> Iterator[str]:
 def _estimate_tokens(text: str) -> int:
     """Rough token count (~4 chars/token) for servers that omit a usage block."""
     return max(1, round(len(text) / 4)) if text else 0
+
+
+# -- grounding helpers ----------------------------------------------------- #
+
+# A tiny stopword list: these words carry no factual content, so matching them
+# between answer and context would inflate the groundedness score.
+_STOPWORDS = frozenset(
+    "a an the is are was were be been being of to in on for and or but with as at "
+    "by from this that these those it its it's their they them he she his her you "
+    "your we our i me my not no do does did has have had will would can could should "
+    "which who whom what when where why how than then so such into about over under".split()
+)
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _build_user_content(prompt: str, context: Optional[Sequence[str]]) -> str:
+    """Fold numbered context sources into the user turn, above the question."""
+    if not context:
+        return prompt
+    sources = "\n".join(f"[{i}] {s}" for i, s in enumerate(context, start=1))
+    return f"Context:\n{sources}\n\nQuestion: {prompt}"
+
+
+def _content_words(text: str) -> set:
+    return {w for w in _WORD_RE.findall(text.lower()) if w not in _STOPWORDS}
+
+
+def groundedness(answer: str, context: Sequence[str]) -> float:
+    """Fraction of the answer's *content words* that also appear in the context.
+
+    A transparent, dependency-free hallucination signal: ``1.0`` means every
+    content word in the answer is present in the supplied sources; a low value
+    means the answer introduced substantial text that isn't in the context --
+    exactly what an invented fact looks like. This is deliberately a lexical
+    proxy (like quantune's "approximate" VRAM numbers): it flags unsupported
+    text, it does not certify that the answer is *true*.
+
+    Returns ``1.0`` for an empty answer (nothing unsupported to report).
+    """
+    # Citation markers like "[1]" are instructed output, not claims -- don't let
+    # them count as unsupported words.
+    answer_words = _content_words(re.sub(r"\[\d+\]", " ", answer))
+    if not answer_words:
+        return 1.0
+    context_words = _content_words(" ".join(context))
+    supported = len(answer_words & context_words)
+    return round(supported / len(answer_words), 3)
+
+
+def _is_abstention(text: str) -> bool:
+    """True when the model declined to answer (the grounded "I don't know" path)."""
+    t = text.strip().lower()
+    return "i don't know" in t or "i do not know" in t

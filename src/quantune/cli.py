@@ -89,6 +89,10 @@ def _cmd_serve(args: argparse.Namespace) -> None:
             return
         if not args.prompt:
             raise ServingError("nothing to do: pass --prompt \"...\" (or --list-models).")
+        context = list(args.context or [])
+        for path in args.context_file or []:
+            with open(path, "r", encoding="utf-8") as fh:
+                context.append(fh.read())
         result = client.generate(
             args.prompt,
             model=args.model,
@@ -96,6 +100,8 @@ def _cmd_serve(args: argparse.Namespace) -> None:
             max_tokens=args.max_tokens,
             temperature=args.temperature,
             stream=args.stream,
+            context=context or None,
+            grounded=True if args.grounded else None,
             on_token=(lambda t: (sys.stdout.write(t), sys.stdout.flush())) if args.stream else None,
         )
     except ServingError as exc:
@@ -155,7 +161,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="OpenAI-compatible /v1 root (NVIDIA NIM by default; use localhost for vLLM/TGI)")
     s.add_argument("--system", default=None, help="optional system prompt")
     s.add_argument("--max-tokens", type=int, default=256)
-    s.add_argument("--temperature", type=float, default=0.2)
+    s.add_argument("--temperature", type=float, default=0.2,
+                   help="use 0 for deterministic, factual answers")
+    s.add_argument("--context", action="append", metavar="TEXT",
+                   help="a source snippet to ground on (repeatable); enables grounded mode")
+    s.add_argument("--context-file", action="append", metavar="PATH",
+                   help="a file whose contents become a grounding source (repeatable)")
+    s.add_argument("--grounded", action="store_true",
+                   help="apply the strict answer-only-from-context prompt (auto-on with --context)")
     s.add_argument("--stream", action="store_true", help="stream tokens and measure time-to-first-token")
     s.add_argument("--timeout", type=float, default=60.0)
     s.add_argument("--list-models", action="store_true", help="list available model ids and exit")

@@ -11,11 +11,14 @@ import pytest
 
 from quantune.serving import (
     DEFAULT_BASE_URL,
+    GROUNDING_SYSTEM_PROMPT,
     GenerationResult,
     OpenAICompatClient,
     ServingError,
     _estimate_tokens,
+    _is_abstention,
     _iter_sse,
+    groundedness,
 )
 
 
@@ -130,3 +133,82 @@ def test_iter_sse_skips_blank_and_comment_lines():
 def test_estimate_tokens_fallback():
     assert _estimate_tokens("") == 0
     assert _estimate_tokens("abcd") == 1
+
+
+# -- grounding ------------------------------------------------------------- #
+
+def _chat_response(content, usage=None):
+    return json.dumps(
+        {"model": "m", "choices": [{"message": {"content": content}}], "usage": usage or {}}
+    ).encode()
+
+
+def test_groundedness_fully_supported_is_one():
+    context = ["QLoRA stores frozen base weights in 4-bit NF4 and trains a LoRA adapter."]
+    answer = "QLoRA stores frozen weights in NF4 and trains a LoRA adapter."
+    assert groundedness(answer, context) == 1.0
+
+
+def test_groundedness_penalizes_novel_words():
+    context = ["QLoRA stores frozen base weights in 4-bit NF4 and trains a LoRA adapter."]
+    answer = "QLoRA is a quantum computing technique using nuclear spin resonance."
+    assert groundedness(answer, context) < 0.5
+
+
+def test_groundedness_empty_answer_is_one():
+    assert groundedness("", ["anything"]) == 1.0
+
+
+def test_is_abstention():
+    assert _is_abstention("I don't know.")
+    assert _is_abstention("Sorry, I do not know that.")
+    assert not _is_abstention("The answer is NF4.")
+
+
+def test_grounded_generate_injects_system_prompt_and_context(monkeypatch):
+    captured = _install_urlopen(
+        monkeypatch, lambda req: _FakeResponse(_chat_response("NF4 [1]", {"completion_tokens": 3}))
+    )
+    client = OpenAICompatClient(api_key="nvapi-test")
+    result = client.generate("What dtype?", context=["Weights are stored in NF4."])
+
+    sent = json.loads(captured["req"].data.decode())
+    assert sent["messages"][0] == {"role": "system", "content": GROUNDING_SYSTEM_PROMPT}
+    user = sent["messages"][1]["content"]
+    assert "Context:" in user and "[1] Weights are stored in NF4." in user
+    assert "Question: What dtype?" in user
+    # NF4 appears in the context -> high groundedness, not an abstention.
+    assert result.grounded_fraction == 1.0
+    assert result.abstained is False
+
+
+def test_grounded_generate_flags_abstention(monkeypatch):
+    _install_urlopen(monkeypatch, lambda req: _FakeResponse(_chat_response("I don't know.")))
+    client = OpenAICompatClient(api_key="nvapi-test")
+    result = client.generate("unanswerable?", context=["irrelevant source text"])
+    assert result.abstained is True
+
+
+def test_ungrounded_generate_leaves_grounding_unset(monkeypatch):
+    _install_urlopen(monkeypatch, lambda req: _FakeResponse(_chat_response("hi", {"completion_tokens": 1})))
+    client = OpenAICompatClient(api_key="nvapi-test")
+    result = client.generate("hi")
+    assert result.grounded_fraction is None
+    assert result.abstained is False
+
+
+def test_grounded_flag_without_context_still_sets_system_prompt(monkeypatch):
+    captured = _install_urlopen(monkeypatch, lambda req: _FakeResponse(_chat_response("ok")))
+    client = OpenAICompatClient(api_key="nvapi-test")
+    result = client.generate("hi", grounded=True)
+    sent = json.loads(captured["req"].data.decode())
+    assert sent["messages"][0]["content"] == GROUNDING_SYSTEM_PROMPT
+    # No context supplied -> nothing to score against.
+    assert result.grounded_fraction is None
+
+
+def test_summary_reports_groundedness():
+    r = GenerationResult("x", "m", 1, 1, 0.1, None, 10.0, grounded_fraction=0.5)
+    assert "grounded=50%" in r.summary()
+    r2 = GenerationResult("x", "m", 1, 1, 0.1, None, 10.0, grounded_fraction=0.9, abstained=True)
+    assert "grounded=abstained" in r2.summary()

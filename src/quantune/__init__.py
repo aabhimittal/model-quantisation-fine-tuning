@@ -33,9 +33,11 @@ from .quantization import (
 from .serving import (
     DEFAULT_BASE_URL,
     DEFAULT_MODEL,
+    GROUNDING_SYSTEM_PROMPT,
     GenerationResult,
     OpenAICompatClient,
     ServingError,
+    groundedness,
 )
 from .vram import ModelSpec, compare_methods, estimate, fits_on, serving_vram
 
@@ -55,6 +57,8 @@ __all__ = [
     "OpenAICompatClient",
     "GenerationResult",
     "ServingError",
+    "groundedness",
+    "GROUNDING_SYSTEM_PROMPT",
     "DEFAULT_BASE_URL",
     "DEFAULT_MODEL",
     "DeploymentScenario",

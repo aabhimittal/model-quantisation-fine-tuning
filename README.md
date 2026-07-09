@@ -131,6 +131,31 @@ Because "fast, low-latency" is a *measurable* claim, every call reports
 **time-to-first-token** and **tokens/sec**. This uses only the Python standard
 library — the `numpy`-only install is unchanged.
 
+### Reduce hallucination — ground it
+
+A small model answering from memory invents facts (in the demo above it called NF4
+"nuclear physics"). quantune's whole thesis is **"RAG for facts, don't bake them into
+weights"** — so at serving time, hand the model the source text and make it answer
+**only** from that, or abstain. Pass `--context`/`--context-file` (or `context=[...]`
+in code) and each answer comes back with a transparent **groundedness score** — the
+share of the answer's content words actually found in your sources:
+
+```bash
+# ungrounded: answers from memory, often wrong
+quantune serve --prompt "What problem does QLoRA solve?" --temperature 0
+
+# grounded: answer must come from the sources, and gets scored
+quantune serve --prompt "What problem does QLoRA solve?" --temperature 0 \
+    --context-file docs/concepts.md
+#   ...QLoRA keeps frozen base weights in 4-bit NF4 and trains a small LoRA adapter... [1]
+#   [model=meta/llama-3.1-8b-instruct  ttft=310 ms  speed=48 tok/s  grounded=92%]
+```
+
+If the answer isn't in the sources, a grounded model replies `"I don't know."`
+(`abstained=True`) instead of guessing. Use `--temperature 0` for deterministic,
+factual answers. The score is an honest lexical proxy — it flags unsupported text, it
+doesn't certify truth. See `examples/05_grounded_generation.py` for a before/after.
+
 ## 60-second tour (library)
 
 ```python
@@ -172,7 +197,7 @@ src/quantune/
 ├── deploy.py        # serving advisor: NIM/vLLM/TGI/Bedrock + copy-paste launch configs
 ├── serving.py       # OpenAI-compatible client: real GPU-cloud generation, stdlib only
 └── cli.py           # `quantune advise | vram | quantize | deploy | serve`
-examples/            # 4 runnable demos (the 4th makes a real NIM call if a key is set)
+examples/            # 5 runnable demos (04/05 make real NIM calls if a key is set)
 tests/               # pytest suite covering every claim above (serving mocked, no network)
 docs/concepts.md     # the theory, mapped to the code
 ```
