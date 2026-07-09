@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package (with dev deps)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Smoke-test the CLI and examples
+        run: |
+          quantune advise --task style --examples 2000 --model-b 7 --vram 24
+          quantune vram --model-b 7
+          quantune quantize --rows 128 --cols 128
+          python examples/01_lora_from_scratch.py
+          python examples/02_quantize_linear.py
+          python examples/03_advisor_and_vram.py
