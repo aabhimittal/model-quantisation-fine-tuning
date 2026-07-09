@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quantune"
+version = "0.1.0"
+description = "A glass-box, decision-first toolkit for LLM fine-tuning (LoRA/QLoRA) and quantization (int8/int4/NF4)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Abhishek Mittal" }]
+keywords = ["llm", "fine-tuning", "lora", "qlora", "quantization", "nf4", "peft"]
+dependencies = ["numpy>=1.23"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+quantune = "quantune.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/aabhimittal/model-quantisation-fine-tuning"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
