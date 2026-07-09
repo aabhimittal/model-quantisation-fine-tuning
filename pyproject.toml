@@ -10,7 +10,8 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Abhishek Mittal" }]
-keywords = ["llm", "fine-tuning", "lora", "qlora", "quantization", "nf4", "peft"]
+keywords = ["llm", "fine-tuning", "lora", "qlora", "quantization", "nf4", "peft",
+            "serving", "inference", "nvidia-nim", "vllm", "tgi", "bedrock"]
 dependencies = ["numpy>=1.23"]
 
 [project.optional-dependencies]

@@ -78,6 +78,64 @@ The optimizer state — two moments plus an fp32 master copy per trainable
 parameter — is the real memory killer in full fine-tuning. Freezing the base
 weights makes it vanish for 99% of the model.
 
+## 5. Serving — where the trained model actually runs
+
+Training answers "can I *make* this model?"; serving answers "can I *run* it fast,
+for many requests, without buying a cluster?" Two ideas make this tractable in a
+CPU-only, glass-box toolkit.
+
+**Serving is much cheaper than training.** Inference has no gradients and no
+optimizer state — the two buckets that dominate full fine-tuning. What's left is
+the weights (in the serving dtype) plus a **KV cache**: for every token in the
+context, each layer stores a key and a value vector so past tokens aren't
+recomputed. `quantune.vram.serving_vram` estimates exactly that — weights +
+`2 × layers × hidden × seq_len × batch`. A 7B model that needs ~113 GB to
+*train* serves in ~14 GB of weights plus a little cache.
+
+**One API unifies the backends.** The brief's three "fast serving" tools —
+NVIDIA NIM, vLLM, and Hugging Face TGI — all expose the **OpenAI chat-completions
+wire format**. So a single client (`quantune.serving.OpenAICompatClient`, ~200
+lines of standard-library HTTP, no `openai` SDK) reaches all of them; you only
+change the `base_url`:
+
+| `base_url` | What it hits | GPU |
+| --- | --- | --- |
+| `https://integrate.api.nvidia.com/v1` | NVIDIA NIM (hosted catalog) | **theirs** — free key, none of your own |
+| `http://localhost:8000/v1` | self-hosted vLLM or NIM container | yours |
+| `http://localhost:8080/v1` | Hugging Face TGI | yours |
+
+This is why a laptop-only project can still demonstrate real, low-latency GPU-cloud
+generation: the accelerator lives in NVIDIA's data center, and we just POST JSON to
+it. `quantune.deploy.advise_deployment` chooses among these four (adding AWS
+Bedrock for the fully-managed case) with the same transparent, reasoned rules the
+training advisor uses, and emits a copy-paste launch config for the winner.
+
+Because "low-latency" is a claim you should be able to *check*, the client measures
+**time-to-first-token** (how long until the stream starts) and **tokens/sec**
+(sustained throughput) on every call — the serving analogue of the VRAM table.
+
+### Grounding & hallucination
+
+Section 1 said fine-tuning teaches *behaviour*, and *facts* belong in retrieval (RAG)
+so they don't get baked into the weights and hallucinated. That decision has a direct
+serving-time consequence. Asked "what does QLoRA solve?", a small model answering from
+its parameters alone will happily invent "Quantum LoRA" — the weights are a lossy,
+uncertain store of facts.
+
+**Grounded generation** applies the RAG rule at inference: instead of trusting the
+weights, you hand the model the source text and instruct it to answer *only* from that,
+citing which snippet it used, and to say "I don't know" when the sources don't cover the
+question (`quantune.serving.GROUNDING_SYSTEM_PROMPT`). The facts come from the context
+you control, not from parametric memory, so there is far less room to confabulate.
+
+To keep this honest and inspectable, `quantune.serving.groundedness` returns the
+fraction of the answer's content words that actually appear in the supplied sources.
+A high score means the answer stays close to its evidence; a low score means it
+introduced text that isn't there — the fingerprint of a hallucination. Like the VRAM
+numbers, it's a deliberately simple proxy: **it flags unsupported text, it does not
+prove the answer is true.** Pair it with `temperature=0` (greedy decoding) so factual
+answers are deterministic rather than sampled.
+
 ## References
 
 1. Hu et al., *LoRA: Low-Rank Adaptation of Large Language Models* (2021), arXiv:2106.09685.

@@ -5,16 +5,21 @@ Subcommands mirror the library:
 * ``advise``   -- get a fine-tune / method / serving recommendation.
 * ``vram``     -- print the memory breakdown for full/LoRA/QLoRA.
 * ``quantize`` -- benchmark every quantization scheme on random weights.
+* ``deploy``   -- recommend a serving backend (NIM/vLLM/TGI/Bedrock) + launch config.
+* ``serve``    -- actually generate text on GPU cloud via an OpenAI-compatible endpoint.
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
 
 import numpy as np
 
 from .advisor import Scenario, advise
+from .deploy import DeploymentScenario, _default_model_for, advise_deployment, render_config
 from .quantization import compare_schemes
+from .serving import DEFAULT_BASE_URL, DEFAULT_MODEL, OpenAICompatClient, ServingError
 from .vram import ModelSpec, compare_methods
 
 
@@ -57,6 +62,58 @@ def _cmd_quantize(args: argparse.Namespace) -> None:
               f"{m['bits_per_weight']:>9.2f}")
 
 
+def _cmd_deploy(args: argparse.Namespace) -> None:
+    if args.emit_config:
+        # Pick the backend's natural default model id unless the user overrode --model.
+        model = args.model if args.model != DEFAULT_MODEL else _default_model_for(args.emit_config)
+        print(render_config(args.emit_config, model=model, dtype=args.dtype, gpus=args.gpus))
+        return
+    scenario = DeploymentScenario(
+        model_params_b=args.model_b,
+        has_own_gpu=args.has_gpu,
+        gpu_vram_gb=args.vram,
+        latency_sensitive=args.latency_sensitive,
+        budget_sensitive=args.budget_sensitive,
+        wants_managed=args.managed,
+        in_aws=args.in_aws,
+    )
+    print(advise_deployment(scenario).summary())
+
+
+def _cmd_serve(args: argparse.Namespace) -> None:
+    client = OpenAICompatClient(base_url=args.base_url, timeout=args.timeout)
+    try:
+        if args.list_models:
+            for mid in client.list_models():
+                print(mid)
+            return
+        if not args.prompt:
+            raise ServingError("nothing to do: pass --prompt \"...\" (or --list-models).")
+        context = list(args.context or [])
+        for path in args.context_file or []:
+            with open(path, "r", encoding="utf-8") as fh:
+                context.append(fh.read())
+        result = client.generate(
+            args.prompt,
+            model=args.model,
+            system=args.system,
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            stream=args.stream,
+            context=context or None,
+            grounded=True if args.grounded else None,
+            on_token=(lambda t: (sys.stdout.write(t), sys.stdout.flush())) if args.stream else None,
+        )
+    except ServingError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    if args.stream:
+        print()  # newline after the streamed tokens
+    else:
+        print(result.text)
+    print(f"\n[{result.summary()}]", file=sys.stderr)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="quantune", description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="command", required=True)
@@ -81,6 +138,41 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--cols", type=int, default=512)
     q.add_argument("--block-size", type=int, default=64)
     q.set_defaults(func=_cmd_quantize)
+
+    d = sub.add_parser("deploy", help="recommend a serving backend + launch config")
+    d.add_argument("--model-b", type=float, default=8.0, help="model size in billions")
+    d.add_argument("--has-gpu", action="store_true", help="you have GPUs to self-host on")
+    d.add_argument("--vram", type=float, default=24.0, help="per-GPU VRAM budget in GB")
+    d.add_argument("--latency-sensitive", action="store_true")
+    d.add_argument("--budget-sensitive", action="store_true")
+    d.add_argument("--managed", action="store_true", help="prefer a no-servers managed backend")
+    d.add_argument("--in-aws", action="store_true", help="already running on AWS")
+    d.add_argument("--emit-config", choices=list(("nvidia_nim", "vllm", "tgi", "bedrock")),
+                   help="just print the launch config for this backend and exit")
+    d.add_argument("--model", default=DEFAULT_MODEL, help="model id for --emit-config")
+    d.add_argument("--dtype", default="fp16", choices=["fp16", "int8", "nf4"], help="serving dtype for --emit-config")
+    d.add_argument("--gpus", type=int, default=1, help="GPU count for --emit-config")
+    d.set_defaults(func=_cmd_deploy)
+
+    s = sub.add_parser("serve", help="generate text on GPU cloud (OpenAI-compatible endpoint)")
+    s.add_argument("--prompt", help="the user prompt to generate from")
+    s.add_argument("--model", default=DEFAULT_MODEL)
+    s.add_argument("--base-url", default=DEFAULT_BASE_URL,
+                   help="OpenAI-compatible /v1 root (NVIDIA NIM by default; use localhost for vLLM/TGI)")
+    s.add_argument("--system", default=None, help="optional system prompt")
+    s.add_argument("--max-tokens", type=int, default=256)
+    s.add_argument("--temperature", type=float, default=0.2,
+                   help="use 0 for deterministic, factual answers")
+    s.add_argument("--context", action="append", metavar="TEXT",
+                   help="a source snippet to ground on (repeatable); enables grounded mode")
+    s.add_argument("--context-file", action="append", metavar="PATH",
+                   help="a file whose contents become a grounding source (repeatable)")
+    s.add_argument("--grounded", action="store_true",
+                   help="apply the strict answer-only-from-context prompt (auto-on with --context)")
+    s.add_argument("--stream", action="store_true", help="stream tokens and measure time-to-first-token")
+    s.add_argument("--timeout", type=float, default=60.0)
+    s.add_argument("--list-models", action="store_true", help="list available model ids and exit")
+    s.set_defaults(func=_cmd_serve)
     return p
 
 
