@@ -117,3 +117,18 @@ def compare_methods(spec: ModelSpec, **kwargs) -> dict:
 def fits_on(total_gb: float, gpu_vram_gb: float, safety: float = 0.9) -> bool:
     """Whether an estimated footprint fits, leaving a safety margin for fragmentation."""
     return total_gb <= gpu_vram_gb * safety
+
+
+def serving_vram(spec: ModelSpec, dtype: str = "fp16") -> float:
+    """Estimate *inference* memory in GB: weights plus a rough KV-cache term.
+
+    Serving is far cheaper than training -- there are no gradients or optimizer
+    moments -- so the footprint is essentially the weights in the serving dtype
+    plus the key/value cache that grows with sequence length and batch size.
+    The KV cache holds two tensors (K and V) per layer, each ``hidden_size`` wide,
+    for every token in the context, kept in the compute dtype.
+    """
+    weights_gb = spec.num_params * BYTES[dtype] / 1e9
+    kv_elements = 2 * spec.num_layers * spec.hidden_size * spec.seq_len * spec.batch_size
+    kv_gb = kv_elements * BYTES["fp16"] / 1e9
+    return round(weights_gb + kv_gb, 3)

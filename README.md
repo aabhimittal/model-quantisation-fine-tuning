@@ -86,6 +86,51 @@ blockwise_int4       0.1125     0.8600      4.25   ← per-block scales rescue i
 nf4                  0.0937     0.5605      4.25   ← normal-aware levels win
 ```
 
+**4. Where do I serve it, and how do I launch that?**
+
+```bash
+$ quantune deploy --model-b 8            # no GPU of your own? -> hosted GPU cloud
+Backend:   NVIDIA NIM (hosted GPU cloud)
+Serving:   fp16
+Serve VRAM:17.074 GB (weights + KV cache)
+GPUs:      none of your own (provider-hosted)
+Why:
+  - No GPUs of your own -- NVIDIA NIM hosts the model on its cloud GPUs behind a
+    free, OpenAI-compatible endpoint, so you can serve today with zero infrastructure.
+...
+$ quantune deploy --model-b 70 --has-gpu --budget-sensitive   # own GPUs -> vLLM, + launch cmd
+$ quantune deploy --emit-config tgi --gpus 2                   # just print a TGI docker run
+```
+
+The advisor's four backends — **NVIDIA NIM**, **vLLM**, **Hugging Face TGI**, **AWS
+Bedrock** — are the same ones the brief names, and `deploy` prints a copy-paste
+launch config for each.
+
+## Serve it for real on GPU cloud (NVIDIA NIM) — no GPU required
+
+quantune runs on your laptop, but it can *drive* a real GPU by talking the
+OpenAI-compatible wire format to a hosted endpoint. NIM, vLLM, and TGI all speak it,
+so one client + a swapped `base_url` reaches all three. Get a **free** key at
+[build.nvidia.com](https://build.nvidia.com) (Get API Key → `nvapi-...`; no credit
+card, no GPU), then:
+
+```bash
+export NVIDIA_API_KEY=nvapi-...
+quantune serve --prompt "Explain NF4 in one sentence." --stream
+#   ...streams tokens from NVIDIA's cloud GPUs...
+#   [model=meta/llama-3.1-8b-instruct  tokens=39  ttft=520 ms  speed=51.5 tok/s  total=0.76s]
+```
+
+Same client, self-hosted server — just change one flag:
+
+```bash
+quantune serve --base-url http://localhost:8000/v1 --prompt "Hello!"   # vLLM / local NIM
+```
+
+Because "fast, low-latency" is a *measurable* claim, every call reports
+**time-to-first-token** and **tokens/sec**. This uses only the Python standard
+library — the `numpy`-only install is unchanged.
+
 ## 60-second tour (library)
 
 ```python
@@ -105,6 +150,15 @@ reconstructed = dequantize(qt)            # ~4 bits/weight, normal-aware
 # --- Advisor: get a reasoned recommendation ---
 rec = advise(Scenario(task="knowledge", num_examples=8000, data_changes_often=True))
 print(rec.approach)                       # -> "rag"  (don't bake changing facts into weights)
+
+# --- Deploy: pick a serving backend, then generate on GPU cloud ---
+from quantune import DeploymentScenario, advise_deployment, OpenAICompatClient
+plan = advise_deployment(DeploymentScenario(model_params_b=8, has_own_gpu=False))
+print(plan.backend)                       # -> "nvidia_nim"
+
+client = OpenAICompatClient()             # reads NVIDIA_API_KEY; no local GPU needed
+out = client.generate("Say hi in French.", stream=True)
+print(out.text, out.tokens_per_s)         # real tokens from NVIDIA's cloud GPUs
 ```
 
 ## What's inside
@@ -115,9 +169,11 @@ src/quantune/
 ├── vram.py          # four-bucket training-memory estimator (weights/grads/optim/acts)
 ├── lora.py          # LoRALinear from scratch: forward, merge, hand-derived SGD
 ├── quantization.py  # int8 (sym/affine), int4, block-wise, and NF4 — all from scratch
-└── cli.py           # `quantune advise | vram | quantize`
-examples/            # 3 runnable, CPU-only demos
-tests/               # 27 pytest tests covering every claim above
+├── deploy.py        # serving advisor: NIM/vLLM/TGI/Bedrock + copy-paste launch configs
+├── serving.py       # OpenAI-compatible client: real GPU-cloud generation, stdlib only
+└── cli.py           # `quantune advise | vram | quantize | deploy | serve`
+examples/            # 4 runnable demos (the 4th makes a real NIM call if a key is set)
+tests/               # pytest suite covering every claim above (serving mocked, no network)
 docs/concepts.md     # the theory, mapped to the code
 ```
 

@@ -33,6 +33,10 @@ jobs:
           quantune advise --task style --examples 2000 --model-b 7 --vram 24
           quantune vram --model-b 7
           quantune quantize --rows 128 --cols 128
+          quantune deploy --model-b 8
+          quantune deploy --model-b 70 --has-gpu --budget-sensitive
+          quantune deploy --emit-config vllm --gpus 2
           python examples/01_lora_from_scratch.py
           python examples/02_quantize_linear.py
           python examples/03_advisor_and_vram.py
+          python examples/04_serve_on_nvidia_nim.py   # live call auto-skips without a key
