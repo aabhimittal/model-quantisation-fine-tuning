@@ -136,6 +136,21 @@ numbers, it's a deliberately simple proxy: **it flags unsupported text, it does 
 prove the answer is true.** Pair it with `temperature=0` (greedy decoding) so factual
 answers are deterministic rather than sampled.
 
+Grounding targets *factual* error. A different failure — a wrong **chain of reasoning** —
+calls for a different tool: **self-consistency** (Wang et al., 2022). Instead of trusting
+one greedy decode, sample the answer several times with the temperature up and keep the
+majority. Independent samples rarely repeat the *same* mistake, so voting cancels one-off
+slips; and because free-text answers seldom match verbatim, `quantune.serving` clusters
+them by lexical overlap (Jaccard over content words) and returns the largest cluster's
+medoid. The agreement fraction is itself a confidence signal — when the samples scatter,
+the model is unsure and no single answer should be trusted.
+
+The deployment advisor ties this back to the task type, exactly as the training advisor
+does: `quantune.deploy.advise_deployment` recommends **grounded** serving for `knowledge`
+tasks (facts belong in context, not weights) and **self-consistency** for `reasoning`
+tasks (vote over chains) — the serving-time echo of "fine-tune for behaviour, RAG for
+facts".
+
 ## References
 
 1. Hu et al., *LoRA: Low-Rank Adaptation of Large Language Models* (2021), arXiv:2106.09685.

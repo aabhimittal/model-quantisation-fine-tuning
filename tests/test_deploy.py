@@ -93,6 +93,33 @@ def test_render_config_covers_all_backends():
         assert render_config(backend)  # non-empty
 
 
+def test_knowledge_task_recommends_grounded():
+    plan = advise_deployment(DeploymentScenario(task="knowledge", model_params_b=8))
+    assert plan.grounded is True
+    assert plan.self_consistency == 1
+    assert "Grounding: grounded" in plan.summary()
+
+
+def test_reasoning_task_recommends_self_consistency():
+    plan = advise_deployment(DeploymentScenario(task="reasoning", model_params_b=8))
+    assert plan.self_consistency == 5
+    assert plan.grounded is False
+    assert "sample-and-vote" in plan.summary()
+
+
+def test_style_task_needs_neither():
+    plan = advise_deployment(DeploymentScenario(task="style", model_params_b=8))
+    assert plan.grounded is False
+    assert plan.self_consistency == 1
+
+
+def test_task_does_not_change_backend_choice():
+    # Grounding/voting are orthogonal to where you serve.
+    base = advise_deployment(DeploymentScenario(task="style", has_own_gpu=False))
+    know = advise_deployment(DeploymentScenario(task="knowledge", has_own_gpu=False))
+    assert base.backend == know.backend == "nvidia_nim"
+
+
 def test_serving_vram_is_smaller_than_training():
     spec = ModelSpec(params_billion=7)
     # fp16 serving = ~14 GB weights + a little KV cache; far below full-FT training.

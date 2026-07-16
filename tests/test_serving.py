@@ -18,6 +18,8 @@ from quantune.serving import (
     _estimate_tokens,
     _is_abstention,
     _iter_sse,
+    _jaccard,
+    _vote,
     groundedness,
 )
 
@@ -212,3 +214,83 @@ def test_summary_reports_groundedness():
     assert "grounded=50%" in r.summary()
     r2 = GenerationResult("x", "m", 1, 1, 0.1, None, 10.0, grounded_fraction=0.9, abstained=True)
     assert "grounded=abstained" in r2.summary()
+
+
+# -- self-consistency voting ----------------------------------------------- #
+
+def test_jaccard_bounds():
+    assert _jaccard(set(), set()) == 1.0
+    assert _jaccard({"a", "b"}, {"a", "b"}) == 1.0
+    assert _jaccard({"a", "b"}, {"c", "d"}) == 0.0
+    assert _jaccard({"a", "b"}, {"a", "c"}) == pytest.approx(1 / 3)
+
+
+def test_vote_majority_wins_over_outliers():
+    answers = [
+        "QLoRA stores frozen weights in 4-bit NF4 and trains a LoRA adapter.",
+        "The frozen base weights are stored in NF4, a 4-bit datatype, with a LoRA adapter.",
+        "It keeps frozen weights in 4-bit NF4 and trains a small LoRA adapter.",
+        "QLoRA uses quantum entanglement to compress the model.",
+        "QLoRA is a reinforcement learning algorithm for robots.",
+    ]
+    winner, votes = _vote(answers, threshold=0.4)
+    assert votes == 3
+    assert "nf4" in winner.lower()
+
+
+def test_vote_all_distinct_returns_first_singleton():
+    answers = ["alpha one", "beta two", "gamma three"]
+    winner, votes = _vote(answers, threshold=0.9)
+    assert votes == 1
+    assert winner == "alpha one"  # ties break to the earliest
+
+
+def test_vote_empty():
+    assert _vote([], 0.6) == ("", 0)
+
+
+def _install_sequenced_urlopen(monkeypatch, bodies):
+    """Return successive response bodies on successive urlopen() calls."""
+    calls = {"n": 0}
+    seq = list(bodies)
+
+    def fake_urlopen(req, timeout=None):
+        body = seq[min(calls["n"], len(seq) - 1)]
+        calls["n"] += 1
+        return _FakeResponse(body)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    return calls
+
+
+def test_self_consistency_votes_across_samples(monkeypatch):
+    bodies = [
+        _chat_response("The answer is NF4, a 4-bit datatype."),
+        _chat_response("NF4 -- a 4-bit datatype -- is the answer."),
+        _chat_response("The answer is NF4, a 4-bit datatype."),
+        _chat_response("The answer is a quantum hologram."),
+    ]
+    calls = _install_sequenced_urlopen(monkeypatch, bodies)
+    client = OpenAICompatClient(api_key="nvapi-test")
+    result = client.self_consistency("What dtype?", n=4, threshold=0.5)
+
+    assert calls["n"] == 4                 # made exactly n calls
+    assert result.n_samples == 4
+    assert result.votes == 3               # three NF4-ish answers agree
+    assert result.agreement == 0.75
+    assert "nf4" in result.text.lower()
+    assert "self-consistency=3/4" in result.summary()
+
+
+def test_self_consistency_rejects_bad_n(monkeypatch):
+    client = OpenAICompatClient(api_key="nvapi-test")
+    with pytest.raises(ValueError):
+        client.self_consistency("hi", n=0)
+
+
+def test_self_consistency_scores_groundedness_when_context(monkeypatch):
+    bodies = [_chat_response("Weights are stored in NF4.")] * 3
+    _install_sequenced_urlopen(monkeypatch, bodies)
+    client = OpenAICompatClient(api_key="nvapi-test")
+    result = client.self_consistency("dtype?", n=3, context=["Weights are stored in NF4."])
+    assert result.grounded_fraction == 1.0

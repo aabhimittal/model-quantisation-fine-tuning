@@ -72,6 +72,7 @@ def _cmd_deploy(args: argparse.Namespace) -> None:
         model_params_b=args.model_b,
         has_own_gpu=args.has_gpu,
         gpu_vram_gb=args.vram,
+        task=args.task,
         latency_sensitive=args.latency_sensitive,
         budget_sensitive=args.budget_sensitive,
         wants_managed=args.managed,
@@ -93,6 +94,22 @@ def _cmd_serve(args: argparse.Namespace) -> None:
         for path in args.context_file or []:
             with open(path, "r", encoding="utf-8") as fh:
                 context.append(fh.read())
+        if args.self_consistency > 1:
+            # Sample-and-vote: streaming and self-consistency don't mix, so run blocking.
+            result = client.self_consistency(
+                args.prompt,
+                n=args.self_consistency,
+                model=args.model,
+                system=args.system,
+                max_tokens=args.max_tokens,
+                temperature=args.temperature if args.temperature > 0 else 0.7,
+                threshold=args.sc_threshold,
+                context=context or None,
+                grounded=True if args.grounded else None,
+            )
+            print(result.text)
+            print(f"\n[{result.summary()}]", file=sys.stderr)
+            return
         result = client.generate(
             args.prompt,
             model=args.model,
@@ -141,6 +158,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     d = sub.add_parser("deploy", help="recommend a serving backend + launch config")
     d.add_argument("--model-b", type=float, default=8.0, help="model size in billions")
+    d.add_argument("--task", default="style", choices=["style", "format", "knowledge", "reasoning"],
+                   help="what the model does -- drives grounding / self-consistency advice")
     d.add_argument("--has-gpu", action="store_true", help="you have GPUs to self-host on")
     d.add_argument("--vram", type=float, default=24.0, help="per-GPU VRAM budget in GB")
     d.add_argument("--latency-sensitive", action="store_true")
@@ -169,6 +188,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="a file whose contents become a grounding source (repeatable)")
     s.add_argument("--grounded", action="store_true",
                    help="apply the strict answer-only-from-context prompt (auto-on with --context)")
+    s.add_argument("--self-consistency", type=int, default=1, metavar="N",
+                   help="sample N answers and return the majority (voting cuts hallucination)")
+    s.add_argument("--sc-threshold", type=float, default=0.6,
+                   help="similarity threshold for grouping self-consistency answers")
     s.add_argument("--stream", action="store_true", help="stream tokens and measure time-to-first-token")
     s.add_argument("--timeout", type=float, default=60.0)
     s.add_argument("--list-models", action="store_true", help="list available model ids and exit")

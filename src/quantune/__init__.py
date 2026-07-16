@@ -36,6 +36,7 @@ from .serving import (
     GROUNDING_SYSTEM_PROMPT,
     GenerationResult,
     OpenAICompatClient,
+    SelfConsistencyResult,
     ServingError,
     groundedness,
 )
@@ -56,6 +57,7 @@ __all__ = [
     "serving_vram",
     "OpenAICompatClient",
     "GenerationResult",
+    "SelfConsistencyResult",
     "ServingError",
     "groundedness",
     "GROUNDING_SYSTEM_PROMPT",

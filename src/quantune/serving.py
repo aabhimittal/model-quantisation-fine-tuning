@@ -95,6 +95,37 @@ class GenerationResult:
         return "  ".join(parts)
 
 
+@dataclass
+class SelfConsistencyResult:
+    """The winning answer from sample-and-vote, plus how much the samples agreed.
+
+    Self-consistency generates the same prompt several times with sampling on, then
+    keeps the answer from the largest agreement cluster. High ``agreement`` means the
+    model kept landing on the same answer (a confidence signal); low agreement means
+    it wandered -- often the fingerprint of a made-up or shaky answer.
+    """
+
+    text: str                       # representative answer of the winning cluster
+    model: str
+    n_samples: int
+    votes: int                      # samples in the winning cluster
+    agreement: float                # votes / n_samples
+    samples: List[str]              # every sampled answer, for inspection
+    total_latency_s: float
+    grounded_fraction: Optional[float] = None
+
+    def summary(self) -> str:
+        parts = [
+            f"model={self.model}",
+            f"self-consistency={self.votes}/{self.n_samples} agree "
+            f"({self.agreement * 100:.0f}%)",
+            f"total={self.total_latency_s:.2f}s",
+        ]
+        if self.grounded_fraction is not None:
+            parts.append(f"grounded={self.grounded_fraction * 100:.0f}%")
+        return "  ".join(parts)
+
+
 class ServingError(RuntimeError):
     """Raised for missing credentials or a non-2xx response from the endpoint."""
 
@@ -214,6 +245,58 @@ class OpenAICompatClient:
             result.abstained = _is_abstention(result.text)
             result.grounded_fraction = groundedness(result.text, context)
         return result
+
+    def self_consistency(
+        self,
+        prompt: str,
+        *,
+        n: int = 5,
+        model: str = DEFAULT_MODEL,
+        system: Optional[str] = None,
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        threshold: float = 0.6,
+        context: Optional[Sequence[str]] = None,
+        grounded: Optional[bool] = None,
+    ) -> SelfConsistencyResult:
+        """Generate ``n`` sampled answers and return the one the samples agree on.
+
+        A single greedy answer is the easiest thing for a model to get confidently
+        wrong. Self-consistency (Wang et al., 2022) instead samples several times
+        with ``temperature > 0`` and keeps the majority answer. Because free-text
+        answers rarely match character-for-character, agreement is measured by
+        lexical overlap (Jaccard over content words) and answers within ``threshold``
+        of each other are treated as the same cluster; the largest cluster wins and
+        its most central member (medoid) is returned. Low agreement is itself a
+        useful hallucination signal.
+        """
+        if n < 1:
+            raise ValueError("n must be >= 1")
+        start = time.perf_counter()
+        samples = [
+            self.generate(
+                prompt,
+                model=model,
+                system=system,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                context=context,
+                grounded=grounded,
+            ).text
+            for _ in range(n)
+        ]
+        total_latency = time.perf_counter() - start
+        winner, votes = _vote(samples, threshold)
+        return SelfConsistencyResult(
+            text=winner,
+            model=model,
+            n_samples=n,
+            votes=votes,
+            agreement=round(votes / n, 3),
+            samples=samples,
+            total_latency_s=total_latency,
+            grounded_fraction=groundedness(winner, context) if context else None,
+        )
 
     def _generate_blocking(self, payload: dict, model: str) -> GenerationResult:
         start = time.perf_counter()
@@ -346,3 +429,42 @@ def _is_abstention(text: str) -> bool:
     """True when the model declined to answer (the grounded "I don't know" path)."""
     t = text.strip().lower()
     return "i don't know" in t or "i do not know" in t
+
+
+# -- self-consistency voting ----------------------------------------------- #
+
+def _jaccard(a: set, b: set) -> float:
+    """Similarity of two content-word sets: |intersection| / |union|."""
+    if not a and not b:
+        return 1.0
+    union = a | b
+    return len(a & b) / len(union) if union else 1.0
+
+
+def _vote(answers: Sequence[str], threshold: float = 0.6) -> tuple[str, int]:
+    """Cluster ``answers`` by lexical similarity; return (winner, cluster_size).
+
+    Answers whose Jaccard content-word similarity is ``>= threshold`` are grouped
+    together. The largest cluster wins, and its representative is the medoid -- the
+    member most similar to the rest of the cluster, i.e. the least idiosyncratic
+    phrasing of the agreed answer. Ties break toward the earliest answer.
+    """
+    if not answers:
+        return "", 0
+    word_sets = [_content_words(a) for a in answers]
+    clusters: List[List[int]] = []
+    for i in range(len(answers)):
+        placed = False
+        for cluster in clusters:
+            if _jaccard(word_sets[i], word_sets[cluster[0]]) >= threshold:
+                cluster.append(i)
+                placed = True
+                break
+        if not placed:
+            clusters.append([i])
+    winner = max(clusters, key=len)  # max() keeps the first on ties
+    medoid = max(
+        winner,
+        key=lambda i: sum(_jaccard(word_sets[i], word_sets[j]) for j in winner),
+    )
+    return answers[medoid], len(winner)

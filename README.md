@@ -156,6 +156,30 @@ If the answer isn't in the sources, a grounded model replies `"I don't know."`
 factual answers. The score is an honest lexical proxy — it flags unsupported text, it
 doesn't certify truth. See `examples/05_grounded_generation.py` for a before/after.
 
+### Reduce hallucination, again — vote on it (self-consistency)
+
+Grounding fixes *fact* questions. For *reasoning*, the risk is a wrong chain of steps,
+and the better lever is **self-consistency**: sample the answer several times and keep
+the majority. Independent samples rarely make the same mistake, so voting cancels
+one-off slips — and the agreement score doubles as a confidence signal.
+
+```bash
+quantune serve --prompt "A bat and ball cost \$1.10; the bat costs \$1 more than the
+    ball. How much is the ball?" --self-consistency 5
+#   $0.05
+#   [model=meta/llama-3.1-8b-instruct  self-consistency=4/5 agree (80%)  total=3.1s]
+```
+
+The **deployment advisor knows which lever fits which task** — pass `--task`:
+
+```bash
+quantune deploy --task knowledge   # -> Grounding: grounded (answer only from sources)
+quantune deploy --task reasoning   # -> Decoding:  5x sample-and-vote (self-consistency)
+```
+
+This mirrors the training advisor's "RAG for facts" rule at serving time. See
+`examples/06_self_consistency.py`.
+
 ## 60-second tour (library)
 
 ```python
@@ -197,7 +221,7 @@ src/quantune/
 ├── deploy.py        # serving advisor: NIM/vLLM/TGI/Bedrock + copy-paste launch configs
 ├── serving.py       # OpenAI-compatible client: real GPU-cloud generation, stdlib only
 └── cli.py           # `quantune advise | vram | quantize | deploy | serve`
-examples/            # 5 runnable demos (04/05 make real NIM calls if a key is set)
+examples/            # 6 runnable demos (04-06 make real NIM calls if a key is set)
 tests/               # pytest suite covering every claim above (serving mocked, no network)
 docs/concepts.md     # the theory, mapped to the code
 ```
