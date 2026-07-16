@@ -40,6 +40,7 @@ class DeploymentScenario:
     model_params_b: float = 8.0
     has_own_gpu: bool = False       # do you have GPUs to run a server on?
     gpu_vram_gb: float = 24.0       # per-GPU budget, if you have one
+    task: str = "style"             # "style" | "format" | "knowledge" | "reasoning"
     latency_sensitive: bool = False
     budget_sensitive: bool = False
     wants_managed: bool = False     # prefer "no servers to babysit"
@@ -52,6 +53,8 @@ class DeploymentPlan:
     serving_dtype: str              # "fp16" | "int8" | "nf4"
     est_serving_vram_gb: float
     gpus_needed: int                # 0 for fully hosted/managed backends
+    grounded: bool = False          # answer only from retrieved sources (anti-hallucination)
+    self_consistency: int = 1       # sample N times and vote; 1 = single greedy answer
     reasons: List[str] = field(default_factory=list)
     launch_config: str = ""
 
@@ -67,11 +70,23 @@ class DeploymentPlan:
             if self.gpus_needed
             else "GPUs:      none of your own (provider-hosted)"
         )
+        grounding_line = (
+            "grounded (answer only from retrieved sources, cite, abstain)"
+            if self.grounded
+            else "off (model answers from its own weights)"
+        )
+        sc_line = (
+            f"{self.self_consistency}x sample-and-vote (self-consistency)"
+            if self.self_consistency > 1
+            else "single answer"
+        )
         lines = [
             f"Backend:   {pretty}",
             f"Serving:   {self.serving_dtype}",
             f"Serve VRAM:{self.est_serving_vram_gb} GB (weights + KV cache)",
             gpu_line,
+            f"Grounding: {grounding_line}",
+            f"Decoding:  {sc_line}",
             "Why:",
         ]
         lines += [f"  - {r}" for r in self.reasons]
@@ -149,15 +164,49 @@ def advise_deployment(scenario: DeploymentScenario) -> DeploymentPlan:
                 f"plan for ~{gpus} GPUs (tensor-parallel) or a smaller/quantized model."
             )
 
+    # -- Anti-hallucination: how should we generate for this task? --------- #
+    grounded, self_consistency = _pick_generation_strategy(scenario.task, reasons)
+
     plan = DeploymentPlan(
         backend=backend,
         serving_dtype=dtype,
         est_serving_vram_gb=est_vram,
         gpus_needed=gpus,
+        grounded=grounded,
+        self_consistency=self_consistency,
         reasons=reasons,
     )
     plan.launch_config = render_config(backend, model=_default_model_for(backend), dtype=dtype, gpus=max(1, gpus))
     return plan
+
+
+def _pick_generation_strategy(task: str, reasons: List[str]) -> tuple[bool, int]:
+    """Decide grounding and self-consistency from the task -- the anti-hallucination knobs.
+
+    Mirrors the training advisor's "RAG for facts" rule at serving time: fact-heavy
+    tasks get grounded generation so answers come from sources, not weights;
+    multi-step reasoning gets self-consistency (sample several times and vote) since
+    a single greedy chain is the easiest thing for a model to get confidently wrong.
+    """
+    if task == "knowledge":
+        reasons.append(
+            "Knowledge/fact task: serve with grounded generation -- answer only from "
+            "retrieved sources (cite, and abstain when they don't cover it) so facts "
+            "come from context, not hallucinated from the weights."
+        )
+        return True, 1
+    if task == "reasoning":
+        reasons.append(
+            "Reasoning task: use self-consistency -- sample the answer ~5x and take the "
+            "majority. Voting over independent chains cancels one-off reasoning slips a "
+            "single greedy pass would commit to."
+        )
+        return False, 5
+    reasons.append(
+        "Behaviour/format/style task: a single grounded-optional answer is fine; no "
+        "extra fact-checking needed at serving time."
+    )
+    return False, 1
 
 
 def _default_model_for(backend: str) -> str:
